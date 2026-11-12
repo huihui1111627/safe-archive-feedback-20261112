@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>安全解压服务</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --border: #e3e6ea;
+    --text: #1f2329;
+    --muted: #767d87;
+    --blue: #2b6cd6;
+    --green: #2fa362;
+    --red: #d64545;
+    --amber: #c98a1a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+
+  .drop {
+    background: var(--card);
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 40px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .drop.drag { border-color: var(--blue); background: #eef3fc; }
+  .drop p { margin: 6px 0; }
+  .drop .hint { color: var(--muted); font-size: 12px; }
+  .drop strong { color: var(--blue); }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-top: 14px;
+  }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .fname { font-weight: 600; word-break: break-all; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-all; }
+
+  .bar { height: 8px; background: #eceef1; border-radius: 99px; margin-top: 12px; overflow: hidden; }
+  .bar > i {
+    display: block; height: 100%; width: 0;
+    background: var(--blue); border-radius: 99px;
+    transition: width .2s ease;
+  }
+  .bar.done > i { background: var(--green); }
+  .bar.failed > i { background: var(--red); }
+
+  .tag {
+    font-size: 12px; padding: 3px 10px; border-radius: 99px; white-space: nowrap;
+  }
+  .tag.pending, .tag.running, .tag.packaging { background: #eef3fc; color: var(--blue); }
+  .tag.done { background: #e8f6ee; color: var(--green); }
+  .tag.failed { background: #fbeaea; color: var(--red); }
+
+  .err {
+    margin-top: 10px; font-size: 13px; color: var(--red);
+    background: #fdf2f2; border: 1px solid #f3d4d4;
+    border-radius: 8px; padding: 8px 10px;
+  }
+  a.dl {
+    display: inline-block; font-size: 13px; text-decoration: none;
+    color: #fff; background: var(--green);
+    padding: 6px 14px; border-radius: 8px; white-space: nowrap;
+  }
+  a.dl:hover { background: #278f55; }
+  .section-title { font-size: 14px; color: var(--muted); margin: 28px 0 6px; }
+  .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>安全解压服务</h1>
+  <p class="sub">支持 zip / tar / tar.gz。越界路径、链接条目和超额解压都会被拦下，整包成功后才能下载。</p>
+
+  <div class="drop" id="drop">
+    <p>把压缩包拖到这里，或 <strong>点击选择文件</strong></p>
+    <p class="hint">单个压缩包最大 {{ max_upload_mb }} MB，解压后总量上限 {{ max_total_mb }} MB，按实际字节校验</p>
+    <input type="file" id="file" accept=".zip,.tar,.gz,.tgz,.bz2,.xz" hidden>
+  </div>
+
+  <div class="section-title">任务列表</div>
+  <div id="jobs"></div>
+</div>
+
+<script>
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('file');
+const jobsEl = document.getElementById('jobs');
+const STATUS_TEXT = {
+  pending: '排队中', running: '解压中', packaging: '打包中',
+  done: '已完成', failed: '已拒绝'
+};
+const jobs = new Map();
+let pollTimer = null;
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('drag');
+  if (e.dataTransfer.files.length) upload(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) upload(fileInput.files[0]);
+  fileInput.value = '';
+});
+
+function fmtBytes(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB'];
+  let v = n, i = -1;
+  do { v /= 1024; i++; } while (v >= 1024 && i < units.length - 1);
+  return v.toFixed(1) + ' ' + units[i];
+}
+
+function upload(file) {
+  const xhr = new XMLHttpRequest();
+  const localId = 'local-' + Math.random().toString(36).slice(2);
+  jobs.set(localId, {
+    filename: file.name, status: 'pending', progress_pct: 0,
+    upload_pct: 0, error: null, local: true
+  });
+  render();
+
+  xhr.upload.onprogress = e => {
+    if (!e.lengthComputable) return;
+    const j = jobs.get(localId);
+    j.upload_pct = Math.round(e.loaded * 100 / e.total);
+    render();
+  };
+  xhr.onload = () => {
+    if (xhr.status === 201) {
+      const { id } = JSON.parse(xhr.responseText);
+      jobs.delete(localId);
+      jobs.set(id, { filename: file.name, status: 'pending', progress_pct: 0, error: null });
+      startPolling();
+    } else {
+      const j = jobs.get(localId);
+      j.status = 'failed';
+      try { j.error = JSON.parse(xhr.responseText).error; }
+      catch { j.error = '上传失败（HTTP ' + xhr.status + '）'; }
+    }
+    render();
+  };
+  xhr.onerror = () => {
+    jobs.get(localId).status = 'failed';
+    jobs.get(localId).error = '网络错误，上传中断';
+    render();
+  };
+  const fd = new FormData();
+  fd.append('archive', file);
+  xhr.open('POST', '/api/jobs');
+  xhr.send(fd);
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(refresh, 700);
+  refresh();
+}
+
+async function refresh() {
+  const remoteIds = [...jobs.keys()].filter(k => !k.startsWith('local-'));
+  if (!remoteIds.length) { clearInterval(pollTimer); pollTimer = null; return; }
+  const res = await fetch('/api/jobs');
+  if (!res.ok) return;
+  const list = await res.json();
+  const live = new Set();
+  for (const st of list) {
+    live.add(st.id);
+    jobs.set(st.id, st);
+  }
+  render();
+  const active = remoteIds.some(id => {
+    const j = jobs.get(id);
+    return j && !['done', 'failed'].includes(j.status);
+  });
+  if (!active) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+function render() {
+  const entries = [...jobs.entries()].reverse();
+  if (!entries.length) {
+    jobsEl.innerHTML = '<div class="card empty">还没有任务</div>';
+    return;
+  }
+  jobsEl.innerHTML = entries.map(([id, j]) => {
+    const st = j.status || 'pending';
+    const pct = j.local ? (j.upload_pct || 0) : (j.progress_pct || 0);
+    const barClass = st === 'done' ? 'done' : st === 'failed' ? 'failed' : '';
+    let meta = '';
+    if (j.local) meta = '上传中 ' + pct + '%';
+    else if (st === 'running') {
+      meta = (j.current_entry ? '正在处理：' + j.current_entry + ' · ' : '')
+           + (j.entries && j.total_entries ? j.entries + '/' + j.total_entries + ' 个条目 · ' : '')
+           + '已解压 ' + fmtBytes(j.bytes_written);
+    } else if (st === 'done') {
+      meta = '解压 ' + fmtBytes(j.bytes_written) + '，结果包 ' + fmtBytes(j.result_size);
+    } else if (st === 'packaging') meta = '正在打包下载文件…';
+    else if (st === 'pending') meta = '排队等待处理';
+    const action = st === 'done'
+      ? '<a class="dl" href="/api/jobs/' + id + '/download">下载结果</a>' : '';
+    const err = st === 'failed' && j.error
+      ? '<div class="err">' + escapeHtml(j.error) + '</div>' : '';
+    return '<div class="card">'
+      + '<div class="row"><div><div class="fname">' + escapeHtml(j.filename || '(任务 ' + id + ')') + '</div>'
+      + '<div class="meta">' + escapeHtml(meta) + '</div></div>'
+      + '<div class="row" style="gap:10px"><span class="tag ' + st + '">' + (STATUS_TEXT[st] || st) + '</span>'
+      + action + '</div></div>'
+      + '<div class="bar ' + barClass + '"><i style="width:' + pct + '%"></i></div>'
+      + err + '</div>';
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+fetch('/api/jobs').then(r => r.json()).then(list => {
+  for (const st of list) jobs.set(st.id, st);
+  if (list.some(j => !['done', 'failed'].includes(j.status))) startPolling();
+  render();
+});
+render();
+</script>
+</body>
+</html>
