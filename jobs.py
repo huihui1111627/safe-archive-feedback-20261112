@@ -60,9 +60,13 @@ class JobStore:
         return secrets.token_hex(16)
 
     def job_dir(self, job_id: str) -> Path:
-        if not all(c in "0123456789abcdef" for c in job_id) or len(job_id) != 32:
+        if not self._valid_id(job_id):
             raise ValueError("非法任务 id")
         return self.jobs_dir / job_id
+
+    @staticmethod
+    def _valid_id(job_id: str) -> bool:
+        return len(job_id) == 32 and all(c in "0123456789abcdef" for c in job_id)
 
     def work_dir(self, job_id: str) -> Path:
         return self.job_dir(job_id) / _WORK_DIR
@@ -114,7 +118,7 @@ class JobStore:
     def list_jobs(self) -> list[dict]:
         out = []
         for jdir in sorted(self.jobs_dir.iterdir(), reverse=True):
-            if not jdir.is_dir():
+            if not jdir.is_dir() or not self._valid_id(jdir.name):
                 continue
             st = self.read_status(jdir.name)
             if st:
@@ -138,6 +142,9 @@ class JobStore:
             if not jdir.is_dir():
                 continue
             job_id = jdir.name
+            # 非任务命名的杂项目录不参与恢复，避免被当成孤儿任务误删
+            if not self._valid_id(job_id):
+                continue
             status = self.read_status(job_id)
             has_result = (jdir / _RESULT).is_file()
 

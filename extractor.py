@@ -36,17 +36,22 @@ class ExtractResult:
 class _Accounter:
     """累计实际写出字节，所有限额以这里为准，不信任压缩包头里的声明。"""
 
-    def __init__(self, total_limit: int):
+    def __init__(self, total_limit: int, ratio_limit: int | None = None):
         self.bytes_left = total_limit
         self.written = 0
+        # 基于压缩包实际字节数算出的膨胀上限，None 表示不做比例检查
+        self.ratio_limit = ratio_limit
 
     def take(self, n: int) -> None:
         if n > self.bytes_left:
             raise UnsafeArchiveError(
                 f"解压后总大小超限（上限 {self._mb(self.bytes_left + self.written)} MB）"
             )
+        new_written = self.written + n
+        if self.ratio_limit is not None and new_written > self.ratio_limit:
+            raise UnsafeArchiveError("整体压缩比超限，疑似解压炸弹")
         self.bytes_left -= n
-        self.written += n
+        self.written = new_written
 
     @staticmethod
     def _mb(n: int) -> str:
@@ -172,11 +177,21 @@ def _extract_tar(
 ) -> ExtractResult:
     total_limit = cfg.max_total_mb * 1024 * 1024
     file_limit = cfg.max_file_mb * 1024 * 1024
-    acc = _Accounter(total_limit)
+    # tar 包头里的 size 可以伪造，所以按压缩包在磁盘上的实际字节算膨胀上限
+    compressed_bytes = archive_path.stat().st_size
+    ratio_cap = compressed_bytes * cfg.max_ratio
+    acc = _Accounter(total_limit, ratio_limit=ratio_cap)
     base = dest.resolve()
     written_entries = 0
 
-    with tarfile.open(archive_path) as tf:
+    try:
+        tf_ctx = tarfile.open(archive_path)
+    except tarfile.ReadError as exc:
+        raise UnsafeArchiveError(
+            "文件不是有效的 tar 包（gzip/xz/bz2 内容必须是 tar 归档）"
+        ) from exc
+
+    with tf_ctx as tf:
         members = tf.getmembers()
         if len(members) > cfg.max_entries:
             raise UnsafeArchiveError(f"条目数超限（上限 {cfg.max_entries}）")

@@ -3,11 +3,17 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+# -I 隔离模式不会把脚本目录放进 sys.path，这里显式加入代码目录。
+# 只加代码目录，data/ 等不可信数据目录永远不在导入路径上，
+# 防止压缩包里夹带的 json.py 之类借 import 劫持执行。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from flask import (
     Flask,
@@ -97,7 +103,10 @@ def _package_result(job_id: str, status: dict) -> None:
 
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for path in sorted(work.rglob("*")):
-            if path.is_file():  # 解压时已拒绝链接，这里只会遇到普通文件/目录
+            # 防御性断言：上游已拒绝链接条目，这里再发现一个就是逻辑被绕过，直接中止
+            if path.is_symlink():
+                raise UnsafeArchiveError(f"工作目录出现意外的符号链接: {path}")
+            if path.is_file():
                 zf.write(path, path.relative_to(work))
 
     size = tmp.stat().st_size
@@ -193,8 +202,14 @@ def create_job():
     archive = store.archive_path(job_id, _sanitize_suffix(upload.filename))
     # 先存为临时文件，完整落盘后再改名，崩溃不会留下半个 archive
     tmp = jdir / "archive.uploading"
-    upload.save(tmp)
-    tmp.rename(archive)
+    try:
+        upload.save(tmp)
+        tmp.rename(archive)
+    except Exception:
+        # 上传中断/超限（413 由 Flask 在 save 时抛 RequestEntityTooLarge）时清掉孤儿任务目录，
+        # 否则只能等到下次重启才被回收
+        store.remove_job(job_id)
+        raise
 
     _pool.submit(_run_job, job_id)
     log.info("job %s created for %s", job_id, upload.filename)

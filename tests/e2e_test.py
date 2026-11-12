@@ -130,6 +130,40 @@ def make_oversize_upload_zip(path: Path, size_mb: int = 3) -> None:
         zf.writestr("big.bin", os.urandom(size_mb * 1024 * 1024))
 
 
+def make_targz_bomb(path: Path, size_mb: int = 5) -> None:
+    """tar.gz 炸弹：gzip 后极小，解压出的 tar 里是大文件，专门打 tar 侧的膨胀检查。"""
+    blob = b"\x00" * size_mb * 1024 * 1024
+    with tarfile.open(path, "w:gz") as tf:
+        info = tarfile.TarInfo("boom.bin")
+        info.size = len(blob)
+        tf.addfile(info, io.BytesIO(blob))
+
+
+def make_duplicate_zip(path: Path) -> None:
+    """同一相对路径写两次，第二次应当触发冲突拒绝，不能静默覆盖。"""
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("same.txt", "first\n")
+        zf.writestr("same.txt", "second\n")
+
+
+def make_pax_longname_tar(path: Path) -> None:
+    """PAX 长名条目，名字藏在扩展头里，后缀拼上穿越路径。"""
+    long_prefix = "a" * 120
+    name = long_prefix + "/../../sas-outside/pax.txt"
+    data = b"pax-pwn\n"
+    with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as tf:
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+
+
+def make_gzip_not_tar(path: Path) -> None:
+    """内容是 gzip 但里面不是 tar 归档，应该得到明确的格式错误而不是 500。"""
+    import gzip
+    with gzip.open(path, "wb") as fh:
+        fh.write(b"this is just gzipped plain text, not a tar\n")
+
+
 # ---------- HTTP 辅助 ----------
 
 def wait_port(timeout: float = 10.0) -> None:
@@ -200,7 +234,7 @@ def start_server(data_dir: Path, env_extra: dict | None = None):
     data_dir.mkdir(parents=True, exist_ok=True)
     log = open(data_dir / "server.log", "wb")
     proc = subprocess.Popen(
-        [sys.executable, str(PROJECT / "app.py")],
+        [sys.executable, "-I", str(PROJECT / "app.py")],
         cwd=PROJECT, env=env, stdout=log, stderr=subprocess.STDOUT,
     )
     wait_port()
@@ -238,6 +272,10 @@ def main() -> int:
     make_bomb_zip(fix_dir / "bomb.zip")
     make_bigfile_zip(fix_dir / "bigfile.zip")
     make_oversize_upload_zip(fix_dir / "oversize.zip")
+    make_targz_bomb(fix_dir / "bomb.tar.gz")
+    make_duplicate_zip(fix_dir / "duplicate.zip")
+    make_pax_longname_tar(fix_dir / "paxlong.tar")
+    make_gzip_not_tar(fix_dir / "plain.gz")
 
     proc = start_server(data_dir)
     try:
@@ -264,7 +302,7 @@ def main() -> int:
         check("正常 tar.gz 任务完成", st["status"] == "done", str(st.get("error")))
 
         print("== 2. 路径越界类攻击 ==")
-        for name in ("zipslip.zip", "abspath.zip", "backslash.zip"):
+        for name in ("zipslip.zip", "abspath.zip", "backslash.zip", "paxlong.tar"):
             code, resp = upload(fix_dir / name)
             st = wait_job(resp["id"])
             check(f"{name} 被拒绝", st["status"] == "failed" and "路径" in (st["error"] or ""),
@@ -272,6 +310,16 @@ def main() -> int:
             jdir = data_dir / "jobs" / resp["id"]
             check(f"{name} 失败后无半成品/原包残留",
                   not (jdir / "extract").exists() and not list(jdir.glob("archive.*")))
+
+        print("== 2b. 重复条目与伪装格式 ==")
+        code, resp = upload(fix_dir / "duplicate.zip")
+        st = wait_job(resp["id"])
+        check("重复路径条目被拒绝", st["status"] == "failed" and "冲突" in (st["error"] or ""),
+              str(st.get("error")))
+        code, resp = upload(fix_dir / "plain.gz")
+        st = wait_job(resp["id"])
+        check("gzip 非 tar 报明确格式错误", st["status"] == "failed" and "tar" in (st["error"] or ""),
+              str(st.get("error")))
 
         print("== 3. 链接与特殊文件 ==")
         for name in ("symlink.zip", "symlink.tar", "hardlink.tar", "device.tar", "fifo.tar"):
@@ -286,13 +334,24 @@ def main() -> int:
         jdir = data_dir / "jobs" / resp["id"]
         check("炸弹失败后解压目录被清掉", not (jdir / "extract").exists())
 
+        code, resp = upload(fix_dir / "bomb.tar.gz")
+        st = wait_job(resp["id"])
+        check("tar.gz 高膨胀炸弹被拒绝", st["status"] == "failed", str(st.get("error")))
+        check("tar.gz 炸弹拒绝原因是炸弹/超限",
+              ("炸弹" in (st["error"] or "")) or ("超限" in (st["error"] or "")),
+              str(st.get("error")))
+
         code, resp = upload(fix_dir / "bigfile.zip")
         st = wait_job(resp["id"])
         check("超单文件限额被拒绝", st["status"] == "failed" and "单文件" in (st["error"] or ""),
               str(st.get("error")))
 
+        jobs_before = {p.name for p in (data_dir / "jobs").iterdir() if p.is_dir()}
         code, resp = upload(fix_dir / "oversize.zip")
         check("超上传限额返回 413", code == 413, str(code))
+        jobs_after = {p.name for p in (data_dir / "jobs").iterdir() if p.is_dir()}
+        check("413 后不留孤儿任务目录", jobs_before == jobs_after,
+              f"新增残留: {jobs_after - jobs_before}")
 
         print("== 5. 下载权限与任务隔离 ==")
         code, _ = get_json(f"/api/jobs/{resp.get('id', 'x' * 32)}/download")
@@ -346,7 +405,7 @@ def main() -> int:
         env = os.environ.copy()
         env.update({"SAS_DATA_DIR": str(data_dir), "SAS_PORT": "8122"})
         p2 = subprocess.Popen(
-            [sys.executable, str(PROJECT / "app.py")],
+            [sys.executable, "-I", str(PROJECT / "app.py")],
             cwd=PROJECT, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
